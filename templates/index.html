@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Material Search Engine</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <main class="container">
+        <header class="header">
+            <div class="header-content">
+                <div class="logo-badge">
+                    <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 21H3V3h18v18zm-2-2V5H5v14h14z"/>
+                        <path d="M9 13h6M9 9h6"/>
+                    </svg>
+                    <span>Material Master</span>
+                </div>
+                <h1>Find Materials Fast</h1>
+                <p>Search our complete catalog with instant autocomplete</p>
+            </div>
+        </header>
+
+        <section class="search-section">
+            <div class="search-wrapper">
+                <div class="search-box">
+                    <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="11" cy="11" r="8"></circle>
+                        <path d="m21 21-4.35-4.35"></path>
+                    </svg>
+                    <input 
+                        type="text" 
+                        id="searchInput" 
+                        placeholder="Search by product, brand, specs..." 
+                        autocomplete="off"
+                        aria-label="Search Materials"
+                        spellcheck="false"
+                    >
+                    <div id="loadingSpinner" class="spinner hidden"></div>
+                    <div class="keyboard-hint">
+                        <span class="hint-text" id="hintText"></span>
+                    </div>
+                </div>
+                
+                <div id="resultCount" class="result-count hidden">
+                    <span id="countText"></span>
+                </div>
+
+                <!-- Suggestions Dropdown -->
+                <ul id="suggestionsList" class="suggestions-list hidden" role="listbox"></ul>
+
+                <!-- Empty State -->
+                <div id="emptyState" class="empty-state hidden">
+                    <div class="empty-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="11" cy="11" r="8"></circle>
+                            <path d="m21 21-4.35-4.35"></path>
+                        </svg>
+                    </div>
+                    <h3>Start your search</h3>
+                    <p>Try searching for common materials:</p>
+                    <div class="suggestion-pills">
+                        <button class="pill" data-search="bearings">Bearings</button>
+                        <button class="pill" data-search="lubricants">Lubricants</button>
+                        <button class="pill" data-search="fasteners">Fasteners</button>
+                        <button class="pill" data-search="seals">Seals & Gaskets</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <script src="/static/js/main.js"></script>
+</body>
+</html>
