@@ -1,421 +1,531 @@
 
-import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import typesense
 
 from config import config
-from text_utils import clean_general_text, extract_model_numbers, dehyphenate_model_numbers
+from text_utils import clean_general_text, extract_model_numbers
 
-logger = logging.getLogger("material-search")
-
-PRIMARY_COLLECTION = "materials_master"
-TEMP_COLLECTION = "materials_temp"
-
-# Pool size per tier per collection before global ranking.
-TIER_POOL_SIZE = 15
-
-
-MASTER_SOURCE_FACTOR = 1.02
-TEMP_SOURCE_FACTOR = 1.00
-BRAND_MATCH_FACTOR = 1.12
-GENERIC_MISMATCH_FACTOR = 0.92
-
-GENERIC_BRANDS = {
-    "generic",
-    "generic brand",
-    "unknown",
-    "unbranded",
-    "na",
-    "n/a",
-    "-",
-}
+try:
+    from text_utils import dehyphenate_model_numbers
+except ImportError:
+    def dehyphenate_model_numbers(model_numbers: str) -> str:
+        if not model_numbers:
+            return ""
+        seen = set()
+        out = []
+        for token in model_numbers.split():
+            token = token.replace("-", "").replace("/", "")
+            if token and token not in seen:
+                out.append(token)
+                seen.add(token)
+        return " ".join(out)
 
 
-_DIM_RE = re.compile(r'\b(\d+(?:\.\d+)?(?:/\d+)?)\s*[xX×]\s*(\d+(?:\.\d+)?(?:/\d+)?)\b')
-_DIM_CHAIN_RE = re.compile(r'\b(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)\b')
-_UNIT_WORDS = {
-    "mm", "cm", "kg", "gm", "gms", "gsm", "ml", "ltr", "kw", "hp", "rpm",
-    "amp", "kv", "v", "w", "inch", "pin", "sqmm", "sqcm", "sq", "core",
-    "phase", "m",
-}
-_UNIT_WORDS_PATTERN = "|".join(sorted(_UNIT_WORDS, key=len, reverse=True))
-_NUM_UNIT_RE = re.compile(rf'(\d+(?:\.\d+)?)\s*({_UNIT_WORDS_PATTERN})\b', re.IGNORECASE)
+# ---------------------------------------------------------------------------
+# Winning evaluator configuration
+# ---------------------------------------------------------------------------
+QUERY_BY = "modelNumbers,brandName,productName,productSpecification,generalText"
+QUERY_BY_WEIGHTS = "3,1,1,2,6"
+NUM_TYPOS = "1,1,2,2,2"
 
-SYMMETRIC_SYNONYMS = [
+# Keep exact identifier searches strict.
+EXACT_NUM_TYPOS = "0"
+
+# Avoid exploding autocomplete latency.
+MAX_VARIANT_SEARCHES = 4
+
+# For short autocomplete fragments, prefix matching is useful.
+# For complete queries, evaluator-style full-token matching is safer.
+PREFIX_QUERY_MAX_CHARS = 3
+
+# Common engineering units. Kept deliberately conservative.
+UNIT_PATTERN = (
+    r"(?:mm|cm|m|km|kg|g|mg|ml|l|kw|w|hp|rpm|psi|bar|"
+    r"awg|swg|v|a|amp|amps|sqmm|sqcm|inch|in|ft|nb|id|od)"
+)
+
+SYMMETRIC_SYNONYMS = (
     ("screw driver", "screwdriver"),
     ("core", "cores"),
     ("cable", "cables"),
     ("v belt", "v-belt"),
     ("tecno", "techno"),
-]
-
-PIPELINE_CONFIG = {
-    "QUERY_BY": "modelNumbers,brandName,productName,productSpecification,generalText",
-    "QUERY_BY_WEIGHTS": "3,1,1,2,6",
-    "NUM_TYPOS": "1,1,2,2,2",
-}
+)
 
 
-def _typesense_client() -> typesense.Client:
-    return typesense.Client({
-        "nodes": [{
-            "host": config.TYPESENSE_HOST,
-            "port": str(config.TYPESENSE_PORT),
-            "protocol": config.TYPESENSE_PROTOCOL,
-        }],
-        "api_key": config.TYPESENSE_API_KEY,
-        "connection_timeout_seconds": 5,
-    })
-
-
-# ---------------------------------------------------------------------
-# Query variant generation
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Query normalization / variants
+# ---------------------------------------------------------------------------
 def _dimension_variants(text: str) -> List[str]:
-    if not _DIM_RE.search(text):
-        return []
-    fused = _DIM_RE.sub(lambda m: f"{m.group(1)}x{m.group(2)}", text)
-    spaced = _DIM_RE.sub(lambda m: f"{m.group(1)} x {m.group(2)}", text)
-    out = []
-    for v in (fused, spaced):
-        if v != text and v not in out:
-            out.append(v)
+    """
+    Generate conservative dimension representations:
+        10x20 <-> 10 x 20
+        10*20 -> 10x20
+        10-20-30 -> 10x20x30
+    """
+    out: List[str] = []
+
+    normalized = re.sub(
+        r"(?<=\d)\s*[*×Xx]\s*(?=\d)",
+        "x",
+        text,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"(?<=\d)\s*-\s*(?=\d)", "x", normalized)
+
+    spaced = re.sub(r"(?<=\d)x(?=\d)", " x ", normalized)
+    fused = re.sub(r"(?<=\d)\s+x\s+(?=\d)", "x", normalized)
+
+    for value in (normalized, spaced, fused):
+        value = re.sub(r"\s+", " ", value).strip()
+        if value and value != text and value not in out:
+            out.append(value)
+
     return out
 
 
 def _dimension_chain_variants(text: str) -> List[str]:
-    if not _DIM_CHAIN_RE.search(text):
-        return []
-    xed = _DIM_CHAIN_RE.sub(lambda m: f"{m.group(1)}x{m.group(2)}x{m.group(3)}", text)
-    return [xed] if xed != text else []
+    """
+    Specifically handle dimension chains such as:
+        10-20-30
+        10 x 20 x 30
+    """
+    out: List[str] = []
+
+    chain_pattern = r"\b(\d+(?:\.\d+)?)(?:\s*[-x×X*]\s*)(\d+(?:\.\d+)?)(?:\s*[-x×X*]\s*)(\d+(?:\.\d+)?)\b"
+
+    for match in re.finditer(chain_pattern, text, flags=re.IGNORECASE):
+        a, b, c = match.groups()
+        candidates = [
+            f"{a}x{b}x{c}",
+            f"{a} x {b} x {c}",
+        ]
+        for candidate in candidates:
+            if candidate not in out:
+                out.append(candidate)
+
+    return out
 
 
 def _unit_spacing_variants(text: str) -> List[str]:
-    spaced = re.sub(rf'(\d+(?:\.\d+)?)({_UNIT_WORDS_PATTERN})\b', r'\1 \2', text, flags=re.IGNORECASE)
-    fused = re.sub(rf'(\d+(?:\.\d+)?)\s+({_UNIT_WORDS_PATTERN})\b', r'\1\2', text, flags=re.IGNORECASE)
-    out = []
-    for v in (spaced, fused):
-        if v != text and v not in out:
-            out.append(v)
+    """
+    Handle:
+        20mm <-> 20 mm
+        5kg  <-> 5 kg
+    """
+    out: List[str] = []
+
+    spaced = re.sub(
+        rf"(\d+(?:\.\d+)?)({UNIT_PATTERN})\b",
+        r"\1 \2",
+        text,
+        flags=re.IGNORECASE,
+    )
+    fused = re.sub(
+        rf"(\d+(?:\.\d+)?)\s+({UNIT_PATTERN})\b",
+        r"\1\2",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    for value in (spaced, fused):
+        value = re.sub(r"\s+", " ", value).strip()
+        if value != text and value not in out:
+            out.append(value)
+
     return out
 
 
 def _synonym_variants(text: str) -> List[str]:
-    out = []
+    out: List[str] = []
+
     for a, b in SYMMETRIC_SYNONYMS:
         if a in text:
-            v = text.replace(a, b)
-            if v not in out:
-                out.append(v)
+            value = text.replace(a, b)
+            if value not in out:
+                out.append(value)
+
         if b in text:
-            v = text.replace(b, a)
-            if v not in out:
-                out.append(v)
+            value = text.replace(b, a)
+            if value not in out:
+                out.append(value)
+
     return out
 
 
-def _expand_query_variants(cleaned_query: str, max_variants: int = 4) -> List[str]:
+def expand_query_variants(
+    cleaned_query: str,
+    max_variants: int = MAX_VARIANT_SEARCHES,
+) -> List[str]:
     variants = [cleaned_query]
-    generators = [_dimension_variants, _dimension_chain_variants, _unit_spacing_variants, _synonym_variants]
-    for fn in generators:
-        for v in fn(cleaned_query):
-            if v not in variants:
-                variants.append(v)
-        if len(variants) >= max_variants:
-            break
+
+    generators = (
+        _dimension_variants,
+        _dimension_chain_variants,
+        _unit_spacing_variants,
+        _synonym_variants,
+    )
+
+    for generator in generators:
+        for value in generator(cleaned_query):
+            if value and value not in variants:
+                variants.append(value)
+            if len(variants) >= max_variants:
+                return variants[:max_variants]
+
     return variants[:max_variants]
 
 
-def _extract_number_units(text: str) -> List[Tuple[str, str]]:
-    return [(m.group(1), m.group(2).lower()) for m in _NUM_UNIT_RE.finditer(text)]
+def _extract_number_unit_pairs(text: str) -> List[Tuple[str, str]]:
+    pairs: List[Tuple[str, str]] = []
+
+    pattern = rf"\b(\d+(?:\.\d+)?)\s*({UNIT_PATTERN})\b"
+
+    for number, unit in re.findall(pattern, text, flags=re.IGNORECASE):
+        pair = (number, unit.lower())
+        if pair not in pairs:
+            pairs.append(pair)
+
+    return pairs
 
 
-def _build_query_plan(raw_text: str) -> Dict[str, Any]:
-    cleaned = clean_general_text(raw_text)
-    model_numbers = extract_model_numbers(raw_text)
-    full_query = f"{cleaned} {model_numbers}".strip() if model_numbers else cleaned
+def build_query_plan(raw_query: str) -> Dict[str, Any]:
+    cleaned = clean_general_text(raw_query)
+    models = extract_model_numbers(raw_query)
 
-    variants = _expand_query_variants(full_query)
-    variants = [v for v in variants if v.strip()]
-    if not variants:
-        fallback = raw_text.strip()
-        variants = [fallback] if fallback else ["*"]
+    full_query = f"{cleaned} {models}".strip() if models else cleaned
+
+    if not full_query:
+        full_query = str(raw_query).strip()
+
+    variants = expand_query_variants(full_query)
+
+    dehyphenated = dehyphenate_model_numbers(models)
 
     return {
         "cleaned_query": cleaned,
-        "model_numbers": model_numbers,
-        "model_numbers_dehyphenated": dehyphenate_model_numbers(model_numbers),
-        "variants": variants,
+        "full_query": full_query,
+        "model_numbers": models,
+        "model_numbers_dehyphenated": dehyphenated,
+        "variants": variants or [full_query],
+        "number_unit_pairs": _extract_number_unit_pairs(cleaned),
     }
 
 
-
-def _text_search_request(q: str, per_page: int, collection: str) -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Search parameter builders
+# ---------------------------------------------------------------------------
+def _build_weighted_params(
+    query: str,
+    per_page: int,
+    prefix: bool,
+) -> Dict[str, Any]:
     return {
-        "collection": collection,
-        "q": q,
-        "query_by": PIPELINE_CONFIG["QUERY_BY"],
-        "query_by_weights": PIPELINE_CONFIG["QUERY_BY_WEIGHTS"],
-        "num_typos": PIPELINE_CONFIG["NUM_TYPOS"],
-        "per_page": per_page,
-        "prefix": True,
+        "q": query,
+        "query_by": QUERY_BY,
+        "query_by_weights": QUERY_BY_WEIGHTS,
+        "num_typos": NUM_TYPOS,
+        "text_match_type": "sum_score",
+        "per_page": max(1, per_page),
+        "prefix": prefix,
         "drop_tokens_threshold": 1,
         "typo_tokens_threshold": 2,
         "prioritize_num_matching_fields": True,
-        "text_match_type": "sum_score",
-        "include_fields": "materialId,brandName,productName,productSpecification,categoryName",
+        "include_fields": (
+            "materialId,brandName,productName,variantName,categoryName,"
+            "productSpecification,generalText,listPrice,UOM,shortDescription,"
+            "vendors,ARCvendors,mat_qty"
+        ),
     }
 
 
-def _exact_model_request(model_numbers: str, per_page: int, collection: str) -> Dict[str, Any]:
+def _build_exact_model_params(
+    model_query: str,
+    per_page: int,
+) -> Dict[str, Any]:
     return {
-        "collection": collection,
-        "q": model_numbers,
+        "q": model_query,
         "query_by": "modelNumbers",
-        "num_typos": "0",
+        "num_typos": EXACT_NUM_TYPOS,
+        "text_match_type": "sum_score",
+        "per_page": max(1, per_page),
         "prefix": False,
-        "infix": "fallback",
-        "per_page": per_page,
-        "include_fields": "materialId,brandName,productName,productSpecification,categoryName",
+        "prioritize_num_matching_fields": True,
+        "include_fields": (
+            "materialId,brandName,productName,variantName,categoryName,"
+            "productSpecification,generalText,listPrice,UOM,shortDescription,"
+            "vendors,ARCvendors,mat_qty"
+        ),
     }
 
 
-def _number_unit_request(cleaned_query: str, per_page: int, collection: str) -> Optional[Dict[str, Any]]:
-    pairs = _extract_number_units(cleaned_query)
-    if not pairs:
-        return None
-    phrase = " ".join(f"{n}{u}" for n, u in pairs)
+def _build_number_unit_params(
+    phrase: str,
+    per_page: int,
+) -> Dict[str, Any]:
     return {
-        "collection": collection,
         "q": phrase,
         "query_by": "productSpecification",
-        "num_typos": "0",
+        "num_typos": EXACT_NUM_TYPOS,
+        "text_match_type": "sum_score",
+        "per_page": max(1, per_page),
         "prefix": False,
-        "per_page": per_page,
-        "include_fields": "materialId,brandName,productName,productSpecification,categoryName",
+        "drop_tokens_threshold": 0,
+        "prioritize_num_matching_fields": True,
+        "include_fields": (
+            "materialId,brandName,productName,variantName,categoryName,"
+            "productSpecification,generalText,listPrice,UOM,shortDescription,"
+            "vendors,ARCvendors,mat_qty"
+        ),
     }
 
 
-def _normalize_text(value: Any) -> str:
-    """Normalize text for conservative brand matching only."""
-    if value is None:
-        return ""
-    value = str(value).strip().lower()
-    value = re.sub(r"[^a-z0-9]+", " ", value)
-    return re.sub(r"\s+", " ", value).strip()
+# ---------------------------------------------------------------------------
+# Result helpers
+# ---------------------------------------------------------------------------
+def _material_id(document: Dict[str, Any]) -> str:
+    return str(
+        document.get("materialId")
+        or document.get("MaterialId")
+        or document.get("id")
+        or ""
+    ).strip()
 
 
-def _is_generic_brand(brand: Any) -> bool:
-    normalized = _normalize_text(brand)
-    return not normalized or normalized in GENERIC_BRANDS
+def _safe_number(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
-def _brand_occurs_in_query(brand: Any, query: str) -> bool:
-    """Return True only when the full known brand appears in the query.
-
-    We deliberately do NOT infer a brand from the first word of the query.
-    The brand must come from a real indexed brandName returned by the search
-    candidates, which keeps this logic conservative.
+def _merge_documents(
+    existing: Dict[str, Dict[str, Any]],
+    hits: List[Dict[str, Any]],
+    tier: int,
+) -> None:
     """
-    brand_norm = _normalize_text(brand)
-    query_norm = _normalize_text(query)
+    Merge by materialId.
 
-    if not brand_norm or _is_generic_brand(brand_norm):
-        return False
-    if len(brand_norm) < 2:
-        return False
+    tier:
+        0 = exact model
+        1 = exact number/unit
+        2 = normal weighted search
 
-    # Word-boundary matching after normalization. This also handles brands
-    # containing spaces, e.g. "Asian Paints".
-    return re.search(rf"(?<!\w){re.escape(brand_norm)}(?!\w)", query_norm) is not None
+    Lower tier wins when the same material is returned by multiple searches.
+    """
+    for rank, document in enumerate(hits):
+        mid = _material_id(document)
+        if not mid:
+            # Do not discard anonymous documents; use object identity fallback.
+            mid = f"__anonymous__{id(document)}"
+
+        candidate = {
+            "document": document,
+            "tier": tier,
+            "rank": rank,
+        }
+
+        current = existing.get(mid)
+
+        if current is None:
+            existing[mid] = candidate
+            continue
+
+        if (tier, rank) < (current["tier"], current["rank"]):
+            existing[mid] = candidate
 
 
-def _hit_to_doc(hit: Dict[str, Any], source: str, kind: str, query_variant: Optional[str] = None) -> Dict[str, Any]:
-    doc = hit["document"]
-    return {
-        "materialId": doc.get("materialId"),
-        "brandName": doc.get("brandName"),
-        "productName": doc.get("productName"),
-        "productSpecification": doc.get("productSpecification"),
-        "categoryName": doc.get("categoryName"),
-        "score": hit.get("text_match") or 0,
-        "source": source,
-        "match_type": kind,
-        "query_variant": query_variant,
-        # Filled during global ranking once candidate brands are known.
-        "brand_match": False,
-        "ranking_score": 0.0,
-    }
+def _final_sort_key(item: Dict[str, Any]) -> Tuple[int, int, float]:
+    """
+    Exact identifier matches first, then exact number/unit matches, then
+    normal relevance. Within a tier, preserve Typesense's ranking and use
+    mat_qty only as a late tie-breaker.
+    """
+    document = item["document"]
+    tier = item["tier"]
+    rank = item["rank"]
+
+    return (
+        tier,
+        rank,
+        -_safe_number(document.get("mat_qty", 0)),
+    )
 
 
+# ---------------------------------------------------------------------------
+# Search service
+# ---------------------------------------------------------------------------
 class SearchService:
-    
     def __init__(self):
-        self._client = _typesense_client()
+        self.client = typesense.Client(
+            {
+                "nodes": [
+                    {
+                        "host": config.TYPESENSE_HOST,
+                        "port": str(config.TYPESENSE_PORT),
+                        "protocol": config.TYPESENSE_PROTOCOL,
+                    }
+                ],
+                "api_key": config.TYPESENSE_API_KEY,
+                "connection_timeout_seconds": 5,
+            }
+        )
 
-    def _build_searches_for_collection(
+    def _search_collection(
         self,
-        plan: Dict[str, Any],
-        collection: str,
-        pool: int,
-    ) -> Tuple[List[Dict[str, Any]], List[Tuple[str, Optional[str]]]]:
-        searches: List[Dict[str, Any]] = []
-        metadata: List[Tuple[str, Optional[str]]] = []
-
-        # 1. Exact-model tier.
-        if plan["model_numbers"]:
-            searches.append(_exact_model_request(plan["model_numbers"], pool, collection))
-            metadata.append(("exact_model", None))
-
-            dehy = plan["model_numbers_dehyphenated"]
-            if dehy and dehy != plan["model_numbers"]:
-                searches.append(_exact_model_request(dehy, pool, collection))
-                metadata.append(("exact_model", None))
-
-        # 2. Number-unit tier.
-        nu_req = _number_unit_request(plan["cleaned_query"], pool, collection)
-        if nu_req is not None:
-            searches.append(nu_req)
-            metadata.append(("number_unit", None))
-
-        # 3. Variant-expansion tier.
-        for variant in plan["variants"]:
-            searches.append(_text_search_request(variant, pool, collection))
-            metadata.append(("variant", variant))
-
-        return searches, metadata
-
-    def _extract_query_brands(self, docs: List[Dict[str, Any]], query: str) -> set:
-        """Find explicit brands mentioned in the query from returned candidates."""
-        query_brands = set()
-        for doc in docs:
-            brand = doc.get("brandName")
-            normalized = _normalize_text(brand)
-            if normalized and not _is_generic_brand(normalized) and _brand_occurs_in_query(normalized, query):
-                query_brands.add(normalized)
-        return query_brands
-
-    def _rank_candidates(self, candidates: List[Tuple[int, float, Dict[str, Any]]], query: str) -> List[Dict[str, Any]]:
-        """Apply source + explicit-brand ranking without replacing tier logic."""
-        docs = [doc for _, _, doc in candidates]
-        query_brands = self._extract_query_brands(docs, query)
-        has_explicit_brand = bool(query_brands)
-
-        ranked: List[Tuple[int, float, Dict[str, Any]]] = []
-
-        for priority, raw_score, doc in candidates:
-            brand_norm = _normalize_text(doc.get("brandName"))
-            brand_match = bool(brand_norm and brand_norm in query_brands)
-            generic = _is_generic_brand(brand_norm)
-
-            source_factor = (
-                MASTER_SOURCE_FACTOR
-                if doc.get("source") == PRIMARY_COLLECTION
-                else TEMP_SOURCE_FACTOR
+        collection_name: str,
+        params: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        try:
+            response = (
+                self.client.collections[collection_name]
+                .documents.search(params)
             )
-
-            adjusted_score = float(raw_score or 0) * source_factor
-
-            if has_explicit_brand:
-                if brand_match:
-                    adjusted_score *= BRAND_MATCH_FACTOR
-                elif generic:
-                    adjusted_score *= GENERIC_MISMATCH_FACTOR
-
-            doc["brand_match"] = brand_match
-            doc["ranking_score"] = adjusted_score
-            doc["explicit_brand_query"] = has_explicit_brand
-
-
-            ranked.append((priority, adjusted_score, doc))
-
-        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return [doc for _, _, doc in ranked]
-
-    def suggest(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
-        query = (query or "").strip()
-        if not query:
+            return [
+                hit.get("document", {})
+                for hit in response.get("hits", [])
+                if hit.get("document")
+            ]
+        except Exception:
+            # Production autocomplete should not fail completely because one
+            # specialized tier failed. The caller can continue with other tiers.
             return []
 
-        plan = _build_query_plan(query)
-        pool = TIER_POOL_SIZE
+    def _search_both_collections(
+        self,
+        params: Dict[str, Any],
+        per_collection: int,
+    ) -> List[Dict[str, Any]]:
+        local_params = dict(params)
+        local_params["per_page"] = max(1, per_collection)
 
+        primary = self._search_collection(
+            "materials_master",
+            local_params,
+        )
+        temporary = self._search_collection(
+            "materials_temp",
+            local_params,
+        )
 
-        searches: List[Dict[str, Any]] = []
-        metadata: List[Tuple[str, str, Optional[str]]] = []
+        merged: List[Dict[str, Any]] = []
+        seen = set()
 
-        for collection in (PRIMARY_COLLECTION, TEMP_COLLECTION):
-            collection_searches, collection_metadata = self._build_searches_for_collection(
-                plan, collection, pool
-            )
-            searches.extend(collection_searches)
-            metadata.extend((kind, collection, variant) for kind, variant in collection_metadata)
+        for document in primary + temporary:
+            mid = _material_id(document)
+            key = mid or f"__anonymous__{id(document)}"
 
-        try:
-            response = self._client.multi_search.perform({"searches": searches}, {})
-        except Exception as e:
-            logger.error(f"Typesense multi_search failed for query '{query}': {e}")
-            raise
-
-        results = response.get("results", [])
-
-        candidates: List[Tuple[int, float, Dict[str, Any]]] = []
-
-        # Keep variant material IDs separately PER COLLECTION. This preserves
-        # the original corroboration rule without cross-collection deduping.
-        variant_mids_by_source: Dict[str, set] = {
-            PRIMARY_COLLECTION: set(),
-            TEMP_COLLECTION: set(),
-        }
-        deferred_results: List[Tuple[Dict[str, Any], str]] = []
-
-        for (kind, collection, query_variant), result in zip(metadata, results):
-            if kind == "number_unit":
-                deferred_results.append((result, collection))
+            if key in seen:
                 continue
 
-            priority = 2 if kind == "exact_model" else 0
+            seen.add(key)
+            merged.append(document)
 
-            for hit in result.get("hits", []):
-                doc = _hit_to_doc(hit, collection, kind, query_variant)
-                if doc["materialId"] is None:
-                    continue
+        return merged
 
-                if kind == "variant":
-                    variant_mids_by_source[collection].add(doc["materialId"])
+    def suggest(self, query: str, limit: int = 5):
+        raw_query = (query or "").strip()
 
-                candidates.append((priority, float(doc["score"]), doc))
+        if not raw_query:
+            return []
 
-        # Number-unit tier is corroborated only by a variant hit from the
-        # SAME collection, mirroring the original pipeline's behaviour.
-        for result, collection in deferred_results:
-            variant_mids = variant_mids_by_source[collection]
+        plan = build_query_plan(raw_query)
 
-            for hit in result.get("hits", []):
-                doc = _hit_to_doc(hit, collection, "number_unit", None)
-                if doc["materialId"] is None:
-                    continue
+        cleaned_query = plan["full_query"]
+        if not cleaned_query:
+            cleaned_query = raw_query
 
-                corroborated = doc["materialId"] in variant_mids
-                priority = 1 if corroborated else 0
-                candidates.append((priority, float(doc["score"]), doc))
+        candidates: Dict[str, Dict[str, Any]] = {}
 
+        # ---------------------------------------------------------------
+        # Tier 0: exact model number
+        # ---------------------------------------------------------------
+        models = plan["model_numbers"]
+        dehyphenated_models = plan["model_numbers_dehyphenated"]
 
-        best_by_source_and_material: Dict[Tuple[str, Any], Tuple[int, float, Dict[str, Any]]] = {}
+        model_queries: List[str] = []
 
-        for priority, score, doc in candidates:
-            key = (doc["source"], doc["materialId"])
-            current = best_by_source_and_material.get(key)
-            if current is None or (priority, score) > (current[0], current[1]):
-                best_by_source_and_material[key] = (priority, score, doc)
+        if models:
+            model_queries.append(models)
 
-        merged_candidates = list(best_by_source_and_material.values())
-        ranked_docs = self._rank_candidates(merged_candidates, query)
+        if dehyphenated_models and dehyphenated_models != models:
+            model_queries.append(dehyphenated_models)
 
-        # Return the globally best N candidates from both collections.
-        return ranked_docs[:limit]
+        for model_query in model_queries[:2]:
+            params = _build_exact_model_params(
+                model_query,
+                max(limit, 5),
+            )
+
+            hits = self._search_both_collections(
+                params,
+                max(limit, 5),
+            )
+
+            _merge_documents(candidates, hits, tier=0)
+
+        # ---------------------------------------------------------------
+        # Tier 1: exact number + unit
+        # ---------------------------------------------------------------
+        pairs = plan["number_unit_pairs"]
+
+        if pairs:
+            phrase = " ".join(
+                f"{number}{unit}"
+                for number, unit in pairs
+            )
+
+            params = _build_number_unit_params(
+                phrase,
+                max(limit, 5),
+            )
+
+            hits = self._search_both_collections(
+                params,
+                max(limit, 5),
+            )
+
+            _merge_documents(candidates, hits, tier=1)
+
+        # ---------------------------------------------------------------
+        # Tier 2: weighted semantic / variant search
+        # ---------------------------------------------------------------
+        prefix = len(raw_query) <= PREFIX_QUERY_MAX_CHARS
+
+        for variant in plan["variants"][:MAX_VARIANT_SEARCHES]:
+            if not variant:
+                continue
+
+            params = _build_weighted_params(
+                variant,
+                max(limit, 5),
+                prefix=prefix,
+            )
+
+            hits = self._search_both_collections(
+                params,
+                max(limit, 5),
+            )
+
+            _merge_documents(candidates, hits, tier=2)
+
+        # ---------------------------------------------------------------
+        # Final ranking
+        # ---------------------------------------------------------------
+        ranked = sorted(
+            candidates.values(),
+            key=_final_sort_key,
+        )
+
+        results = [
+            item["document"]
+            for item in ranked[:limit]
+        ]
+
+        return results
 
 
 search_service = SearchService()
