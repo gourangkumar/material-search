@@ -1,20 +1,17 @@
-"""
-Shared text-cleaning / model-number-extraction logic.
+"""Shared production text normalization for indexing and searching.
 
-CRITICAL: this module must be imported by BOTH preprocess.py (index side)
-and evaluate_search.py (query side). Using two different cleaning
-pipelines for the same match is the #1 cause of query/document mismatch.
+Use this exact module from preprocess.py and search.py. It combines robust ERP
+text cleanup and compound-code preservation with measurement-aware model-number
+extraction, preventing specifications such as 16SQMM or 230V from receiving
+model-number priority.
 """
+
+from __future__ import annotations
+
 import re
-import pandas as pd
+from typing import Any
 
-# -------------------------------------------------------
-# Stop words
-# -------------------------------------------------------
-# "generic" is deliberately included: it is both an ERP placeholder brand
-# label (used even when the real item is branded) AND a genuinely common
-# brandName in the catalog for unbranded items. Either way it carries no
-# discriminating signal and, left in, drowns out real signal via TF weighting.
+
 STOP_WORDS = {
     "generic", "make", "brand", "item", "code", "product", "products",
     "material", "materials", "with", "compatible", "for", "using",
@@ -23,166 +20,180 @@ STOP_WORDS = {
     "quality", "no", "number", "model", "modelno",
 }
 
-# Unit / dimension prefixes commonly fused directly onto a number in MRO
-# descriptions (e.g. "M8", "ID08", "OD2"). Used to force a split so
-# "screwm8" -> "screw m8" instead of staying fused.
-_UNIT_PREFIXES = r"(?:MM|CM|KG|ML|KW|HP|RPM|AWG|SWG|PSI|NB|ID|OD|IN|M|V|A|W|L|G)"
+_UNIT_PREFIXES = (
+    r"(?:MM|CM|KG|ML|KW|HP|RPM|AWG|SWG|PSI|NB|ID|OD|IN|M|V|A|W|L|G)"
+)
+
+_MEASUREMENT_UNITS = (
+    r"(?:mm2|sqmm|sqcm|mm|cm|km|kg|gms?|gsm|mg|ml|ltr|litre|litres|"
+    r"kw|hp|rpm|psi|bar|kv|v|w|amps?|a|awg|swg|inch|in|ft|nb|id|od|"
+    r"pin|phase|cores?|c|m|l|g)"
+)
+
+_MEASUREMENT_TOKEN_RE = re.compile(
+    rf"^\d+(?:\.\d+)?{_MEASUREMENT_UNITS}$",
+    re.IGNORECASE,
+)
+
+# Thread/dimension forms such as M8, M8X20, ID08 and OD2.
+_PREFIXED_MEASUREMENT_RE = re.compile(
+    r"^(?:m|id|od|nb|awg|swg)\d+(?:\.\d+)?(?:x\d+(?:\.\d+)?)?$",
+    re.IGNORECASE,
+)
+
+_MODEL_LABEL_RE = re.compile(
+    r"\b(?:model|part|item)\s*(?:no\.?|number|code)?\s*[:#-]?\s*"
+    r"([a-z0-9][a-z0-9./-]*)",
+    re.IGNORECASE,
+)
+
+_COMPOUND_CODE_RE = re.compile(
+    r"\b[A-Z0-9]+(?:[-/][A-Z0-9]+)+\b",
+    re.IGNORECASE,
+)
+
+
+def _is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(value != value)  # NaN/NaT without requiring pandas.
+    except Exception:
+        return False
 
 
 def _insert_unit_prefix_boundary(text: str) -> str:
-    """Insert a space before a unit-prefix+digit run that's fused onto a
-    preceding word, e.g. 'SCREWM8' -> 'SCREW M8', 'GRUBM5X20' -> 'GRUB M5X20'.
-    """
+    """Turn SCREWM8 into SCREW M8 without breaking genuine model codes."""
     return re.sub(rf"(?<=[A-Z])(?={_UNIT_PREFIXES}\d)", " ", text)
 
 
-# -------------------------------------------------------
-# Model / part number extraction (compound codes kept fused)
-# -------------------------------------------------------
-def extract_model_numbers(text: str) -> str:
-    """Extract dash/slash-joined and alnum part-numbers as standalone tokens.
+def _is_measurement_token(token: str) -> bool:
+    value = token.strip("-/").lower()
+    return bool(
+        _MEASUREMENT_TOKEN_RE.fullmatch(value)
+        or _PREFIXED_MEASUREMENT_RE.fullmatch(value)
+        or re.fullmatch(r"x\d+(?:\.\d+)?", value)
+    )
 
-    Returns a space-joined, deduped, lowercased string of extracted codes.
-    Compound codes (e.g. 'WDS500-G2B0A', '4H-210-08') are kept intact since
-    splitting them destroys the exact identifier. Bare alnum runs are only
-    kept if they mix letters+digits and are long enough to be a real code
-    (avoids false positives like 'kg', 'x1').
+
+def extract_model_numbers(text: Any) -> str:
+    """Extract genuine model/part codes while excluding measurements.
+
+    Examples retained: A9F74106, WDS500-G2B0A, 4H-210-08, 6205-2RS.
+    Examples excluded: 4C, 16SQMM, 20MM, 230V, 10AMP, M8, M8X20.
+    A purely numeric or measurement-like value is retained only when explicitly
+    introduced by a model/part/item label.
     """
-    if pd.isna(text):
+    if _is_missing(text):
         return ""
 
-    text = str(text).upper()
-    codes = []
+    source = str(text).upper()
+    codes: list[str] = []
 
-    # 1. dash/slash joined compound part numbers - keep fused, pull out first
-    compound_pattern = r"\b[A-Z0-9]+(?:[-/][A-Z0-9]+)+\b"
-    for m in re.finditer(compound_pattern, text):
-        codes.append(m.group())
-    remainder = re.sub(compound_pattern, " ", text)
+    # Explicit labels are authoritative, including numeric-only part numbers.
+    for match in _MODEL_LABEL_RE.finditer(source):
+        code = match.group(1).strip("-/")
+        if code:
+            codes.append(code)
 
-    # 2. split a unit-prefix+digit run off a preceding word (SCREWM8 -> SCREW M8)
+    # Preserve compound identifiers, but do not promote plain dimension chains.
+    for match in _COMPOUND_CODE_RE.finditer(source):
+        code = match.group().strip("-/")
+        if any(ch.isalpha() for ch in code) and any(ch.isdigit() for ch in code):
+            if not _is_measurement_token(code):
+                codes.append(code)
+
+    remainder = _COMPOUND_CODE_RE.sub(" ", source)
+    remainder = _MODEL_LABEL_RE.sub(" ", remainder)
     remainder = _insert_unit_prefix_boundary(remainder)
-
-    # 3. any remaining non-alnum/dash/slash char (*, comma, parens, etc.) is a
-    #    hard token boundary - turn into whitespace, don't just delete it,
-    #    otherwise "M8*20" collapses into the bogus code "M820"
     remainder = re.sub(r"[^A-Z0-9/\-\s]", " ", remainder)
 
-    for tok in remainder.split():
-        tok_clean = tok.strip("-/")
-        if len(tok_clean) < 2:
+    for token in remainder.split():
+        token = token.strip("-/")
+        if len(token) < 2 or _is_measurement_token(token):
             continue
-        has_alpha = any(c.isalpha() for c in tok_clean)
-        has_digit = any(c.isdigit() for c in tok_clean)
-        if has_alpha and has_digit:
-            codes.append(tok_clean)
+        if any(ch.isalpha() for ch in token) and any(ch.isdigit() for ch in token):
+            codes.append(token)
 
-    seen = set()
-    out = []
-    for c in codes:
-        c = c.lower()
-        if c not in seen:
-            out.append(c)
-            seen.add(c)
-    return " ".join(out)
+    seen: set[str] = set()
+    output: list[str] = []
+    for code in codes:
+        normalized = code.lower()
+        if normalized and normalized not in seen:
+            output.append(normalized)
+            seen.add(normalized)
+    return " ".join(output)
 
 
-# -------------------------------------------------------
-# General text cleaning (shared)
-# -------------------------------------------------------
 def _split_alnum_boundaries(text: str) -> str:
-    """Insert spaces at letter<->digit boundaries so dimension tokens like
-    'm8', '20mm' surface as standalone tokens instead of staying fused to
-    neighbouring words. Unit-prefix aware first (screwm8 -> screw m8), then
-    a general letter<->digit split for anything left over."""
-    text = _insert_unit_prefix_boundary(text.upper()).lower()
-    return text
+    """Separate a fused word from an engineering unit prefix.
+
+    This intentionally does not split every letter-number boundary, because
+    doing so would damage identifiers such as A9F74106 and 6205ZZ.
+    """
+    return _insert_unit_prefix_boundary(text.upper()).lower()
 
 
-def clean_general_text(text: str, split_alnum: bool = True) -> str:
-    """Lowercase, strip ERP boilerplate, sanitize characters, split alnum
-    boundaries, drop stop words, dedupe while preserving order."""
-    if pd.isna(text):
+def clean_general_text(text: Any, split_alnum: bool = True) -> str:
+    """Clean ERP text consistently while retaining useful engineering terms."""
+    if _is_missing(text):
         return ""
 
-    text = str(text).lower()
+    value = str(text).lower()
+    value = re.sub(r"_x000d_", " ", value, flags=re.IGNORECASE)
 
-    # Strip ERP export artifacts. "_x000d_" is the literal escaped-CR marker
-    # some ERP/Excel exports leave behind in place of real newlines (see
-    # row 0 of Remarks.xlsx - "120MM2\r\r\r\n16MM" survived as raw
-    # "_x000d_" tokens and fragmented "120mm2" downstream). Strip before
-    # anything else touches whitespace.
-    text = re.sub(r"_x000d_", " ", text, flags=re.IGNORECASE)
+    # Canonical unit spellings.
+    value = re.sub(r"\b(\d+(?:\.\d+)?)\s*mm2\b", r"\1sqmm", value)
+    value = re.sub(r"\bsq\.?\s*mm\b", "sqmm", value)
+    value = re.sub(r"\bsq\.?\s*cm\b", "sqcm", value)
 
-    # Normalize the handful of unit spellings that show up interchangeably
-    # in ERP free text vs. the base material master ("sq.mm"/"sq mm"/"sqmm"
-    # all mean the same thing, but only one survives the sanitizer's
-    # allow-listed '.' character unmolested and the others don't match it).
-    # Add more pairs here as eval runs surface them.
-    text = re.sub(r"\bsq\.?\s*mm\b", "sqmm", text)
-    text = re.sub(r"\bsq\.?\s*cm\b", "sqcm", text)
+    # Remove ERP labels and reference values that should not drive relevance.
+    value = re.sub(r"item\s*code\s*[:-]?", " ", value)
+    value = re.sub(r"product\s*code\s*[:-]?", " ", value)
+    value = re.sub(r"po\s*no\.?\s*[:-]?\s*\S+", " ", value)
+    value = re.sub(r"invoice\s*no\.?\s*[:-]?\s*\S+", " ", value)
+    value = re.sub(r"imei\s*no\.?\s*[:-]?\s*\S+", " ", value)
+    value = re.sub(r"serial\s*no\.?\s*[:-]?\s*\S+", " ", value)
 
-    # Strip common ERP prefixes / trailing reference numbers
-    text = re.sub(r"item\s*code\s*[:-]?", " ", text)
-    text = re.sub(r"product\s*code\s*[:-]?", " ", text)
-    text = re.sub(r"po\s*no\.?\s*[:-]?\s*\S+", " ", text)
-    text = re.sub(r"invoice\s*no\.?\s*[:-]?\s*\S+", " ", text)
-    text = re.sub(r"imei\s*no\.?\s*[:-]?\s*\S+", " ", text)
-    text = re.sub(r"serial\s*no\.?\s*[:-]?\s*\S+", " ", text)
-
-    # Sanitize: keep engineering symbols, drop everything else
-    text = re.sub(r"[^a-z0-9./x+\- ]+", " ", text)
-
+    value = re.sub(r"[^a-z0-9./x+\- ]+", " ", value)
     if split_alnum:
-        text = _split_alnum_boundaries(text)
-
-    text = re.sub(r"\s+", " ", text).strip()
+        value = _split_alnum_boundaries(value)
+    value = re.sub(r"\s+", " ", value).strip()
 
     tokens = [
-        t for t in text.split()
-        if t not in STOP_WORDS and not re.fullmatch(r"[.\-/x+]+", t)
+        token
+        for token in value.split()
+        if token not in STOP_WORDS
+        and not re.fullmatch(r"[.\-/x+]+", token)
     ]
 
-    seen = set()
-    cleaned = []
-    for t in tokens:
-        if t not in seen:
-            cleaned.append(t)
-            seen.add(t)
-    return " ".join(cleaned)
+    seen: set[str] = set()
+    output: list[str] = []
+    for token in tokens:
+        if token not in seen:
+            output.append(token)
+            seen.add(token)
+    return " ".join(output)
 
 
 def dehyphenate_model_numbers(model_numbers: str) -> str:
-    """Given the space-joined output of extract_model_numbers, return the
-    same codes with internal dashes/slashes stripped, e.g. 'b-52' -> 'b52'.
-
-    Why this exists: the compound-code branch of extract_model_numbers
-    deliberately keeps a code like 'B-52' fused WITH its dash so an exact
-    identifier like 'WDS500-G2B0A' isn't destroyed. But ERP query text
-    often types a hyphen ("B-52", "55-75-10") where the underlying
-    productSpecification never had one to begin with ("part b52",
-    "55x75x10") - so the query-side and index-side codes diverge on a
-    character that carries no real signal here. Rather than guess which
-    codes "should" keep their dash, generate the stripped form as an
-    additional exact-match candidate and let the search try both.
-    """
+    """Return additional code forms with internal dashes/slashes removed."""
     if not model_numbers:
         return ""
-    stripped = [tok.replace("-", "").replace("/", "") for tok in model_numbers.split()]
-    seen = set()
-    out = []
-    for tok in stripped:
-        if tok and tok not in seen:
-            out.append(tok)
-            seen.add(tok)
-    return " ".join(out)
+
+    seen: set[str] = set()
+    output: list[str] = []
+    for token in str(model_numbers).split():
+        stripped = token.replace("-", "").replace("/", "")
+        if stripped and stripped not in seen:
+            output.append(stripped)
+            seen.add(stripped)
+    return " ".join(output)
 
 
-def clean_and_extract(raw_text: str) -> dict:
-    """One entry point used identically by index-side and query-side code.
-
-    Returns {'general_text': ..., 'model_numbers': ...}
-    """
-    model_numbers = extract_model_numbers(raw_text)
-    general_text = clean_general_text(raw_text, split_alnum=True)
-    return {"general_text": general_text, "model_numbers": model_numbers}
+def clean_and_extract(raw_text: Any) -> dict[str, str]:
+    """Return the two canonical fields used by indexing and searching."""
+    return {
+        "general_text": clean_general_text(raw_text, split_alnum=True),
+        "model_numbers": extract_model_numbers(raw_text),
+    }
