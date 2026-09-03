@@ -1,5 +1,3 @@
-
-
 import logging
 import typesense
 from config import config
@@ -10,7 +8,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # Toggles - see module docstring for the trade-off each one encodes.
 # -------------------------------------------------------
 MODEL_NUMBERS_INFIX = True
-USE_MAT_QTY_SORT = False
+USE_MAT_QTY_SORT = True
 
 
 def get_typesense_client():
@@ -50,12 +48,16 @@ def create_single_collection(client, collection_name: str, force_recreate: bool 
 
     fields = [
         {"name": "materialId", "type": "int64", "sort": True},
+        {"name": "companyERPCode", "type": "string", "optional": True, "infix": True},
+        {"name": "companyERPCodeNormalized", "type": "string", "optional": True, "infix": True},
         {"name": "categoryName", "type": "string", "facet": True, "optional": True},
         {"name": "brandName", "type": "string", "facet": True, "optional": True},
+        {"name": "brandNameNormalized", "type": "string", "facet": True, "optional": True},
         {"name": "productName", "type": "string", "optional": True},
         {"name": "productSpecification", "type": "string", "optional": True},
         model_numbers_field,
         {"name": "generalText", "type": "string", "optional": True},
+        {"name": "generalTextNormalized", "type": "string", "optional": True},
     ]
 
     if USE_MAT_QTY_SORT:
