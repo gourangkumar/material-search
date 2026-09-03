@@ -1,10 +1,3 @@
-"""Shared production text normalization for indexing and searching.
-
-Use this exact module from preprocess.py and search.py. It combines robust ERP
-text cleanup and compound-code preservation with measurement-aware model-number
-extraction, preventing specifications such as 16SQMM or 230V from receiving
-model-number priority.
-"""
 
 from __future__ import annotations
 
