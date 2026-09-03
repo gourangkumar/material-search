@@ -1,39 +1,4 @@
-"""
-create_collection_merged.py
---------------------------------------------------------------------------
-Merge of create_collection.py + create_collection_sai.py.
 
-Diff between the two originals was two changes, both improvements in
-create_collection_sai.py with no offsetting downside in create_collection.py:
-
-  1. modelNumbers gets infix=True (sai) vs no infix (base).
-     Improvement: ERP part numbers are frequently compound ("ABC-4521-X")
-     and procurement users often search on just the numeric segment.
-     Typesense's default tokenizer already splits on the hyphen, so
-     "4521" matches as its own token for well-formed data - infix is a
-     safety net for the messier case where a code is glued together with
-     no separator at all ("ABC4521X"). Kept as a toggle below (
-     MODEL_NUMBERS_INFIX) because infix search always runs once enabled
-     on this Typesense server version (boolean, not the "fallback" mode
-     some newer versions support) - so it's a real query-latency
-     trade-off you may want to switch off if this field gets slow.
-
-  2. mat_qty field + default_sorting_field=mat_qty (sai) vs no mat_qty
-     field + default_sorting_field=materialId (base).
-     Improvement: mat_qty (recent 6-month requirement volume, computed in
-     preprocess.py) as the default sort means Typesense's tie-breaking
-     for equal text_match scores favors materials that are actually
-     being bought, instead of an arbitrary materialId ordering. Kept as
-     a toggle (USE_MAT_QTY_SORT) since it requires preprocess.py/
-     preprocess_merged.py to actually populate mat_qty - if you point
-     this at a CSV that doesn't have it, flip this off rather than
-     letting collection creation fail on a missing default_sorting_field.
-
-Both toggles default to the sai behavior (True) since that's the more
-recent, evaluation-driven version - flip them off individually if you
-need to fall back to the simpler base behavior for either.
---------------------------------------------------------------------------
-"""
 
 import logging
 import typesense
